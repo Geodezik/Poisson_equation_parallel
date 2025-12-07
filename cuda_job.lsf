@@ -1,0 +1,7 @@
+#BSUB -n 1
+#BSUB -o "./test.out"
+#BSUB -e "./test.err"
+#BSUB -R "span[ptile=1]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+mpiexec ./main.o --M 400 --N 600
+
