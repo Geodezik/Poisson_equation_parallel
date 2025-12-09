@@ -158,21 +158,28 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	SAFE_CUDA(cudaMalloc(&d_Ap, n*sizeof(double)));
 	SAFE_CUDA(cudaMalloc(&d_Aw_tmp, n*sizeof(double)));
 	SAFE_CUDA(cudaMalloc(&d_w_good, n*sizeof(double)));
+	double t_c0 = MPI_Wtime();
 	SAFE_CUDA(cudaMemcpy(d_B, B.data(), n*sizeof(double), cudaMemcpyHostToDevice));
 	SAFE_CUDA(cudaMemcpy(d_a, a.data(), (Nx+2)*(Ny+1)*sizeof(double), cudaMemcpyHostToDevice));
 	SAFE_CUDA(cudaMemcpy(d_b, b.data(), (Nx+1)*(Ny+2)*sizeof(double), cudaMemcpyHostToDevice));
 	SAFE_CUDA(cudaMemcpy(d_D, D.data(), n*sizeof(double), cudaMemcpyHostToDevice));
-	SAFE_CUDA(cudaMemset(d_w, 0, n*sizeof(double)));
 	SAFE_CUDA(cudaMemcpy(d_r, d_B, n*sizeof(double), cudaMemcpyDeviceToDevice));
+	t_comm += MPI_Wtime() - t_c0;
+
+	SAFE_CUDA(cudaMemset(d_w, 0, n*sizeof(double)));
 
 	int blocksN = (n + threads_per_block - 1) / threads_per_block;
 	vec_div_kernel<<<blocksN, threads_per_block>>>(d_z, d_r, d_D, n);
+	t_c0 = MPI_Wtime();
 	SAFE_CUDA(cudaMemcpy(d_p, d_z, n*sizeof(double), cudaMemcpyDeviceToDevice));
+	t_comm += MPI_Wtime() - t_c0;
 	SAFE_CUDA(cudaDeviceSynchronize());
 
 	double rz = dot_device(d_r, d_z, n);
 	double rz_global = 0.0;
+	t_c0 = MPI_Wtime();
 	MPI_Allreduce(&rz, &rz_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+	t_comm += MPI_Wtime() - t_c0;
 
 	Boundaries boundaries;
 	boundaries.init(Nx, Ny);
@@ -192,7 +199,9 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 
 		double pAp = dot_device(d_p, d_Ap, n);
 		double pAp_global = 0.0;
+		t_c0 = MPI_Wtime();
 		MPI_Allreduce(&pAp, &pAp_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+		t_comm += MPI_Wtime() - t_c0;
 		double alpha = rz_global / pAp_global;
 
 		wr_update_kernel<<<blocksN, threads_per_block>>>(d_w, d_p, d_r, d_Ap, alpha, n);
@@ -200,31 +209,46 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 
 		double pp = dot_device(d_p, d_p, n);
 		double pp_global = 0.0;
+		t_c0 = MPI_Wtime();
 		MPI_Allreduce(&pp, &pp_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+		t_comm += MPI_Wtime() - t_c0;
 		double step_norm = std::abs(alpha) * std::sqrt(pp_global * (h1*h2));
 		int stop_flag = (step_norm < tol);
 		int stop_any = 0;
+		t_c0 = MPI_Wtime();
 		MPI_Allreduce(&stop_flag, &stop_any, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+		t_comm += MPI_Wtime() - t_c0;
 		if (stop_any) { ++it; break; }
 
 		double Bw_local = dot_device(d_B, d_w, n);
 		double rw_local = dot_device(d_r, d_w, n);
 		double Bw = 0.0, rw = 0.0;
+		t_c0 = MPI_Wtime();
 		MPI_Allreduce(&Bw_local, &Bw, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+		t_comm += MPI_Wtime() - t_c0;
+		t_c0 = MPI_Wtime();
 		MPI_Allreduce(&rw_local, &rw, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+		t_comm += MPI_Wtime() - t_c0;
 		double Jk = -0.5 * ((Bw + rw) * (h1*h2));
 
 		if (!have_J_prev) {
 		    J_prev = Jk;
+		    t_c0 = MPI_Wtime();
 		    SAFE_CUDA(cudaMemcpy(d_w_good, d_w, n*sizeof(double), cudaMemcpyDeviceToDevice));
+		    t_comm += MPI_Wtime() - t_c0;
 		    have_J_prev = 1;
 		    restarted_prev = 0;
 		} else if (Jk > J_prev) {
 		    int restart_any = 1, tmp=0;
+		    t_c0 = MPI_Wtime();
 		    MPI_Allreduce(&restart_any, &tmp, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 		    SAFE_CUDA(cudaMemcpy(d_w, d_w_good, n*sizeof(double), cudaMemcpyDeviceToDevice));
+		    t_comm += MPI_Wtime() - t_c0;
 
+		    t_c0 = MPI_Wtime();
 		    device_sendrecv_boundaries(d_w, Nx, Ny, boundaries, rank_left, rank_right, rank_down, rank_up);
+		    t_comm += MPI_Wtime() - t_c0;
+
 		    build_Aw_kernel<<<blocks, threads_per_block>>>(d_w, d_Aw_tmp, d_a, d_b,
 			boundaries.d_from_left, boundaries.d_from_right,
 			boundaries.d_from_bot, boundaries.d_from_top, Nx, Ny, h1, h2);
@@ -251,7 +275,9 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 		SAFE_CUDA(cudaDeviceSynchronize());
 		double rz_new_local = dot_device(d_r, d_z, n);
 		double rz_new = 0.0;
+		t_c0 = MPI_Wtime();
 		MPI_Allreduce(&rz_new_local, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+		t_comm += MPI_Wtime() - t_c0;
 		double beta = rz_new / rz_global;
 		p_update_kernel<<<blocksN, threads_per_block>>>(d_p, d_z, beta, n);
 		SAFE_CUDA(cudaDeviceSynchronize());
@@ -262,7 +288,9 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	
 	if (rank == 0) std::cout << "Finished in " << it << " iterations" << std::endl;
 
+	t_c0 = MPI_Wtime();
 	SAFE_CUDA(cudaMemcpy(w_final.data(), d_w, n*sizeof(double), cudaMemcpyDeviceToHost));
+	t_comm += MPI_Wtime() - t_c0;
 
 	boundaries.destroy();
 	SAFE_CUDA(cudaFree(d_B)); SAFE_CUDA(cudaFree(d_a)); SAFE_CUDA(cudaFree(d_b)); SAFE_CUDA(cudaFree(d_D));
