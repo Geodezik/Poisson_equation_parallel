@@ -145,7 +145,7 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	}
 
 	const int n = Nx * Ny;
-	double *d_B=nullptr, *d_a=nullptr, *d_b=nullptr, *d_D=nullptr;
+	double *d_B=nullptr, *d_a=nullptr, *d_b=nullptr, *d_D=nullptr, *d_w_good = nullptr;;
 	double *d_w=nullptr, *d_r=nullptr, *d_z=nullptr, *d_p=nullptr, *d_Ap=nullptr, *d_Aw_tmp=nullptr;
 	SAFE_CUDA(cudaMalloc(&d_B, n*sizeof(double)));
 	SAFE_CUDA(cudaMalloc(&d_a, (Nx+2)*(Ny+1)*sizeof(double)));
@@ -157,6 +157,7 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	SAFE_CUDA(cudaMalloc(&d_p, n*sizeof(double)));
 	SAFE_CUDA(cudaMalloc(&d_Ap, n*sizeof(double)));
 	SAFE_CUDA(cudaMalloc(&d_Aw_tmp, n*sizeof(double)));
+	SAFE_CUDA(cudaMalloc(&d_w_good, n*sizeof(double)));
 	SAFE_CUDA(cudaMemcpy(d_B, B.data(), n*sizeof(double), cudaMemcpyHostToDevice));
 	SAFE_CUDA(cudaMemcpy(d_a, a.data(), (Nx+2)*(Ny+1)*sizeof(double), cudaMemcpyHostToDevice));
 	SAFE_CUDA(cudaMemcpy(d_b, b.data(), (Nx+1)*(Ny+2)*sizeof(double), cudaMemcpyHostToDevice));
@@ -177,7 +178,6 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	boundaries.init(Nx, Ny);
 
 	std::vector<double> w_final(n, 0.0);
-	std::vector<double> w_good(n, 0.0);
 	double J_prev = 0.0; int have_J_prev = 0; int restarted_prev = 0;
 
 	int it = 0;
@@ -215,34 +215,36 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 		double Jk = -0.5 * ((Bw + rw) * (h1*h2));
 
 		if (!have_J_prev) {
-			J_prev = Jk;
-			SAFE_CUDA(cudaMemcpy(w_final.data(), d_w, n*sizeof(double), cudaMemcpyDeviceToHost));
-			w_good = w_final;
-			have_J_prev = 1;
-			restarted_prev = 0;
+		    J_prev = Jk;
+		    SAFE_CUDA(cudaMemcpy(d_w_good, d_w, n*sizeof(double), cudaMemcpyDeviceToDevice));
+		    have_J_prev = 1;
+		    restarted_prev = 0;
 		} else if (Jk > J_prev) {
-			int restart_any = 1, tmp=0;
-			MPI_Allreduce(&restart_any, &tmp, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-			SAFE_CUDA(cudaMemcpy(d_w, w_good.data(), n*sizeof(double), cudaMemcpyHostToDevice));
-			device_sendrecv_boundaries(d_w, Nx, Ny, boundaries, rank_left, rank_right, rank_down, rank_up);
-			build_Aw_kernel<<<blocks, threads_per_block>>>(d_w, d_Aw_tmp, d_a, d_b, boundaries.d_from_left, boundaries.d_from_right, boundaries.d_from_bot, boundaries.d_from_top, Nx, Ny, h1, h2);
-			SAFE_CUDA(cudaDeviceSynchronize());
-			vec_sub_kernel<<<blocksN, threads_per_block>>>(d_r, d_B, d_Aw_tmp, n);
-			SAFE_CUDA(cudaDeviceSynchronize());
-			vec_div_kernel<<<blocksN, threads_per_block>>>(d_z, d_r, d_D, n);
-			SAFE_CUDA(cudaMemcpy(d_p, d_z, n*sizeof(double), cudaMemcpyDeviceToDevice));
-			SAFE_CUDA(cudaDeviceSynchronize());
-			double rz_new = dot_device(d_r, d_z, n);
-			MPI_Allreduce(&rz_new, &rz_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-			J_prev = -0.5 * ((dot_device(d_B,d_w,n) + dot_device(d_r,d_w,n)) * (h1*h2));
-			if (restarted_prev) break;
-			restarted_prev = 1;
-			continue;
+		    int restart_any = 1, tmp=0;
+		    MPI_Allreduce(&restart_any, &tmp, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+		    SAFE_CUDA(cudaMemcpy(d_w, d_w_good, n*sizeof(double), cudaMemcpyDeviceToDevice));
+
+		    device_sendrecv_boundaries(d_w, Nx, Ny, boundaries, rank_left, rank_right, rank_down, rank_up);
+		    build_Aw_kernel<<<blocks, threads_per_block>>>(d_w, d_Aw_tmp, d_a, d_b,
+			boundaries.d_from_left, boundaries.d_from_right,
+			boundaries.d_from_bot, boundaries.d_from_top, Nx, Ny, h1, h2);
+		    SAFE_CUDA(cudaDeviceSynchronize());
+
+		    vec_sub_kernel<<<blocksN, threads_per_block>>>(d_r, d_B, d_Aw_tmp, n);
+		    SAFE_CUDA(cudaDeviceSynchronize());
+		    vec_div_kernel<<<blocksN, threads_per_block>>>(d_z, d_r, d_D, n);
+		    SAFE_CUDA(cudaMemcpy(d_p, d_z, n*sizeof(double), cudaMemcpyDeviceToDevice));
+		    SAFE_CUDA(cudaDeviceSynchronize());
+		    double rz_new = dot_device(d_r, d_z, n);
+		    MPI_Allreduce(&rz_new, &rz_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+		    J_prev = -0.5 * ((dot_device(d_B,d_w,n) + dot_device(d_r,d_w,n)) * (h1*h2));
+		    if (restarted_prev) break;
+		    restarted_prev = 1;
+		    continue;
 		} else {
-			J_prev = Jk;
-			SAFE_CUDA(cudaMemcpy(w_final.data(), d_w, n*sizeof(double), cudaMemcpyDeviceToHost));
-			w_good = w_final;
-			restarted_prev = 0;
+		    J_prev = Jk;
+		    SAFE_CUDA(cudaMemcpy(d_w_good, d_w, n*sizeof(double), cudaMemcpyDeviceToDevice));
+		    restarted_prev = 0;
 		}
 
 		vec_div_kernel<<<blocksN, threads_per_block>>>(d_z, d_r, d_D, n);
@@ -265,8 +267,7 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	boundaries.destroy();
 	SAFE_CUDA(cudaFree(d_B)); SAFE_CUDA(cudaFree(d_a)); SAFE_CUDA(cudaFree(d_b)); SAFE_CUDA(cudaFree(d_D));
 	SAFE_CUDA(cudaFree(d_w)); SAFE_CUDA(cudaFree(d_r)); SAFE_CUDA(cudaFree(d_z)); SAFE_CUDA(cudaFree(d_p));
-	SAFE_CUDA(cudaFree(d_Ap)); SAFE_CUDA(cudaFree(d_Aw_tmp));
+	SAFE_CUDA(cudaFree(d_Ap)); SAFE_CUDA(cudaFree(d_Aw_tmp)); SAFE_CUDA(cudaFree(d_w_good));
 
 	return w_final;
 }
-
