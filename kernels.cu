@@ -10,39 +10,42 @@
 
 #define SAFE_CUDA(call) do {cudaError_t err__ = (call); if (err__ != cudaSuccess) {fprintf(stderr, "CUDA ERROR %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); MPI_Abort(MPI_COMM_WORLD, 1); }} while(0)
 
-static int threads_per_block = 256;
-
-__global__ void pack_boundaries_kernel(const double* __restrict__ vec, int Nx, int Ny, double* __restrict__ send_left, double* __restrict__ send_right, double* __restrict__ send_down, double* __restrict__ send_up) {
-	int tid = blockDim.x * blockIdx.x + threadIdx.x;
-	if (tid < Ny) {
-		int idxL = tid;
-		int idxR = (Nx - 1) * Ny + tid;
-		send_left[tid] = vec[idxL];
-		send_right[tid] = vec[idxR];
+__global__ void pack_boundaries_kernel(const double* __restrict__ vec, int Nx, int Ny, double* __restrict__ send_left, double* __restrict__ send_right,
+double* __restrict__ send_down, double* __restrict__ send_up) {
+	int i0 = blockIdx.x * blockDim.x + threadIdx.x; // max Nx-1
+	int j0 = blockIdx.y * blockDim.y + threadIdx.y; // max Ny-1
+	if (i0 == 0 && j0 < Ny) {
+		int idxL = j0;
+		int idxR = (Nx - 1) * Ny + j0;
+		send_left[j0]  = vec[idxL];
+		send_right[j0] = vec[idxR];
 	}
-	if (tid < Nx) {
-		int idxD = tid * Ny;
-		int idxU = (tid + 1) * Ny - 1;
-		send_down[tid] = vec[idxD];
-		send_up[tid] = vec[idxU];
+	if (j0 == 0 && i0 < Nx) {
+		int idxD = i0 * Ny;
+		int idxU = (i0 + 1) * Ny - 1;
+		send_down[i0] = vec[idxD];
+		send_up[i0] = vec[idxU];
 	}
 }
 
-__global__ void build_Aw_kernel(const double* __restrict__ w, double* __restrict__ Aw, const double* __restrict__ a, const double* __restrict__ b,
-const double* __restrict__ from_left, const double* __restrict__ from_right, const double* __restrict__ from_bot, const double* __restrict__ from_top, int Nx, int Ny, double h1, double h2) {
-	int tid = blockDim.x * blockIdx.x + threadIdx.x;
-	int total = Nx * Ny;
-	if (tid >= total) return;
-	int i0 = tid / Ny;
-	int j0 = tid % Ny;
+__global__ void build_Aw_kernel(const double* __restrict__ w, double* __restrict__ Aw,
+const double* __restrict__ a, const double* __restrict__ b,
+const double* __restrict__ from_left, const double* __restrict__ from_right,
+const double* __restrict__ from_bot, const double* __restrict__ from_top,
+int Nx, int Ny, double h1, double h2) {
+	int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+	if (i0 >= Nx || j0 >= Ny) return;
+
 	int i = i0 + 1;
 	int j = j0 + 1;
+	int idx = i0 * Ny + j0;
 
-	double wij = w[(i - 1) * Ny + (j - 1)];
-	double wi1j = (i + 1 <= Nx) ? w[i * Ny + (j - 1)] : from_right[j - 1];
-	double wi_1j = (i - 1 >= 1) ? w[(i - 2) * Ny + (j - 1)] : from_left[j - 1];
-	double wij1 = (j + 1 <= Ny) ? w[(i - 1) * Ny + j] : from_top[i - 1];
-	double wij_1 = (j - 1 >= 1) ? w[(i - 1) * Ny + (j - 2)] : from_bot[i - 1];
+	double wij = w[idx];
+	double wi1j = (i + 1 <= Nx) ? w[(i0 + 1) * Ny + j0] : from_right[j - 1];
+	double wi_1j = (i - 1 >= 1) ? w[(i0 - 1) * Ny + j0] : from_left[j - 1];
+	double wij1 = (j + 1 <= Ny) ? w[i0 * Ny + (j0 + 1)] : from_top[i - 1];
+	double wij_1 = (j - 1 >= 1) ? w[i0 * Ny + (j0 - 1)] : from_bot[i - 1];
 
 	double aij = a[i * (Ny + 1) + j];
 	double ai1j = a[(i + 1) * (Ny + 1) + j];
@@ -51,30 +54,44 @@ const double* __restrict__ from_left, const double* __restrict__ from_right, con
 
 	double term_x = (aij * (wij - wi_1j) - ai1j * (wi1j - wij)) / (h1 * h1);
 	double term_y = (bij * (wij - wij_1) - bij1 * (wij1 - wij)) / (h2 * h2);
-	Aw[(i - 1) * Ny + (j - 1)] = term_x + term_y;
+	Aw[idx] = term_x + term_y;
 }
 
-__global__ void wr_update_kernel(double* __restrict__ w, const double* __restrict__ p, double* __restrict__ r, const double* __restrict__ Ap, double alpha, int n) {
-	int tid = blockDim.x * blockIdx.x + threadIdx.x;
-	if (tid < n) {
-		w[tid] += alpha * p[tid];
-		r[tid] -= alpha * Ap[tid];
-	}
+
+__global__ void wr_update_kernel(double* __restrict__ w, const double* __restrict__ p, double* __restrict__ r, const double* __restrict__ Ap, double alpha, int Nx, int Ny) {
+	int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+	if (i0 >= Nx || j0 >= Ny) return;
+	int idx = i0 * Ny + j0;
+	w[idx] += alpha * p[idx];
+	r[idx] -= alpha * Ap[idx];
 }
 
-__global__ void p_update_kernel(double* __restrict__ p, const double* __restrict__ z, double beta, int n) {
-	int tid = blockDim.x * blockIdx.x + threadIdx.x;
-	if (tid < n) p[tid] = z[tid] + beta * p[tid];
+__global__ void p_update_kernel(double* __restrict__ p, const double* __restrict__ z, double beta, int Nx, int Ny) {
+	int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+	if (i0 >= Nx || j0 >= Ny) return;
+	int idx = i0 * Ny + j0;
+	p[idx] = z[idx] + beta * p[idx];
 }
 
-__global__ void vec_div_kernel(double* __restrict__ c, const double* __restrict__ a, const double* __restrict__ b, int n) {
-	int tid = blockDim.x * blockIdx.x + threadIdx.x;
-	if (tid < n) c[tid] = a[tid] / b[tid];
+__global__ void vec_div_kernel(double* __restrict__ c, const double* __restrict__ a, const double* __restrict__ b, int Nx, int Ny) {
+    int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i0 >= Nx || j0 >= Ny) return;
+    int idx = i0 * Ny + j0;
+    c[idx] = a[idx] / b[idx];
 }
 
-__global__ void vec_sub_kernel(double* __restrict__ c, const double* __restrict__ a, const double* __restrict__ b, int n) {
-	int tid = blockDim.x * blockIdx.x + threadIdx.x;
-	if (tid < n) c[tid] = a[tid] - b[tid];
+__global__ void vec_sub_kernel(double* __restrict__ c,
+                               const double* __restrict__ a,
+                               const double* __restrict__ b,
+                               int Nx, int Ny) {
+    int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i0 >= Nx || j0 >= Ny) return;
+    int idx = i0 * Ny + j0;
+    c[idx] = a[idx] - b[idx];
 }
 
 double dot_device(double* u, double* v, int n) {
@@ -111,9 +128,14 @@ struct Boundaries {
 };
 
 void device_sendrecv_boundaries(const double* d_vec, int Nx, int Ny, Boundaries& boundaries, int rank_left, int rank_right, int rank_down, int rank_up) {
-	int blocks = (std::max(Nx,Ny) + threads_per_block - 1) / threads_per_block;
-	pack_boundaries_kernel<<<blocks, threads_per_block>>>(d_vec, Nx, Ny, boundaries.d_send_left, boundaries.d_send_right, boundaries.d_send_down, boundaries.d_send_up);
+	dim3 block2d(16, 16);
+	dim3 grid2d((Nx + block2d.x - 1) / block2d.x, (Ny + block2d.y - 1) / block2d.y);
+
+	pack_boundaries_kernel<<<grid2d, block2d>>>(d_vec, Nx, Ny,
+	boundaries.d_send_left, boundaries.d_send_right,
+	boundaries.d_send_down, boundaries.d_send_up);
 	SAFE_CUDA(cudaDeviceSynchronize());
+
 	SAFE_CUDA(cudaMemcpy(boundaries.send_left.data(), boundaries.d_send_left, Ny*sizeof(double), cudaMemcpyDeviceToHost));
 	SAFE_CUDA(cudaMemcpy(boundaries.send_right.data(), boundaries.d_send_right, Ny*sizeof(double), cudaMemcpyDeviceToHost));
 	SAFE_CUDA(cudaMemcpy(boundaries.send_down.data(), boundaries.d_send_down, Nx*sizeof(double), cudaMemcpyDeviceToHost));
@@ -168,8 +190,10 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 
 	SAFE_CUDA(cudaMemset(d_w, 0, n*sizeof(double)));
 
-	int blocksN = (n + threads_per_block - 1) / threads_per_block;
-	vec_div_kernel<<<blocksN, threads_per_block>>>(d_z, d_r, d_D, n);
+	dim3 block2d(16, 16);
+	dim3 grid2d((Nx + block2d.x - 1) / block2d.x, (Ny + block2d.y - 1) / block2d.y);
+
+	vec_div_kernel<<<grid2d, block2d>>>(d_z, d_r, d_D, Nx, Ny);
 	t_c0 = MPI_Wtime();
 	SAFE_CUDA(cudaMemcpy(d_p, d_z, n*sizeof(double), cudaMemcpyDeviceToDevice));
 	t_comm += MPI_Wtime() - t_c0;
@@ -190,11 +214,14 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	int it = 0;
 	double t_loop0 = MPI_Wtime();
 	for (; it < maxit; ++it) {
-		double t_c0 = MPI_Wtime();
+		t_c0 = MPI_Wtime();
 		device_sendrecv_boundaries(d_p, Nx, Ny, boundaries, rank_left, rank_right, rank_down, rank_up);
 		t_comm += MPI_Wtime() - t_c0;
-		int blocks = (n + threads_per_block - 1)/threads_per_block;
-		build_Aw_kernel<<<blocks, threads_per_block>>>(d_p, d_Ap, d_a, d_b, boundaries.d_from_left, boundaries.d_from_right, boundaries.d_from_bot, boundaries.d_from_top, Nx, Ny, h1, h2);
+
+		build_Aw_kernel<<<grid2d, block2d>>>(d_p, d_Ap, d_a, d_b,
+		boundaries.d_from_left, boundaries.d_from_right,
+		boundaries.d_from_bot,  boundaries.d_from_top,
+		Nx, Ny, h1, h2);
 		SAFE_CUDA(cudaDeviceSynchronize());
 
 		double pAp = dot_device(d_p, d_Ap, n);
@@ -204,7 +231,7 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 		t_comm += MPI_Wtime() - t_c0;
 		double alpha = rz_global / pAp_global;
 
-		wr_update_kernel<<<blocksN, threads_per_block>>>(d_w, d_p, d_r, d_Ap, alpha, n);
+		wr_update_kernel<<<grid2d, block2d>>>(d_w, d_p, d_r, d_Ap, alpha, Nx, Ny);
 		SAFE_CUDA(cudaDeviceSynchronize());
 
 		double pp = dot_device(d_p, d_p, n);
@@ -232,46 +259,47 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 		double Jk = -0.5 * ((Bw + rw) * (h1*h2));
 
 		if (!have_J_prev) {
-		    J_prev = Jk;
-		    t_c0 = MPI_Wtime();
-		    SAFE_CUDA(cudaMemcpy(d_w_good, d_w, n*sizeof(double), cudaMemcpyDeviceToDevice));
-		    t_comm += MPI_Wtime() - t_c0;
-		    have_J_prev = 1;
-		    restarted_prev = 0;
+			J_prev = Jk;
+			t_c0 = MPI_Wtime();
+			SAFE_CUDA(cudaMemcpy(d_w_good, d_w, n*sizeof(double), cudaMemcpyDeviceToDevice));
+			t_comm += MPI_Wtime() - t_c0;
+			have_J_prev = 1;
+			restarted_prev = 0;
 		} else if (Jk > J_prev) {
-		    int restart_any = 1, tmp=0;
-		    t_c0 = MPI_Wtime();
-		    MPI_Allreduce(&restart_any, &tmp, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-		    SAFE_CUDA(cudaMemcpy(d_w, d_w_good, n*sizeof(double), cudaMemcpyDeviceToDevice));
-		    t_comm += MPI_Wtime() - t_c0;
+			int restart_any = 1, tmp=0;
+			t_c0 = MPI_Wtime();
+			MPI_Allreduce(&restart_any, &tmp, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+			SAFE_CUDA(cudaMemcpy(d_w, d_w_good, n*sizeof(double), cudaMemcpyDeviceToDevice));
+			t_comm += MPI_Wtime() - t_c0;
 
-		    t_c0 = MPI_Wtime();
-		    device_sendrecv_boundaries(d_w, Nx, Ny, boundaries, rank_left, rank_right, rank_down, rank_up);
-		    t_comm += MPI_Wtime() - t_c0;
+			t_c0 = MPI_Wtime();
+			device_sendrecv_boundaries(d_w, Nx, Ny, boundaries, rank_left, rank_right, rank_down, rank_up);
+			t_comm += MPI_Wtime() - t_c0;
 
-		    build_Aw_kernel<<<blocks, threads_per_block>>>(d_w, d_Aw_tmp, d_a, d_b,
+			build_Aw_kernel<<<grid2d, block2d>>>(d_w, d_Aw_tmp, d_a, d_b,
 			boundaries.d_from_left, boundaries.d_from_right,
-			boundaries.d_from_bot, boundaries.d_from_top, Nx, Ny, h1, h2);
-		    SAFE_CUDA(cudaDeviceSynchronize());
+			boundaries.d_from_bot,  boundaries.d_from_top,
+			Nx, Ny, h1, h2);
+			SAFE_CUDA(cudaDeviceSynchronize());
 
-		    vec_sub_kernel<<<blocksN, threads_per_block>>>(d_r, d_B, d_Aw_tmp, n);
-		    SAFE_CUDA(cudaDeviceSynchronize());
-		    vec_div_kernel<<<blocksN, threads_per_block>>>(d_z, d_r, d_D, n);
-		    SAFE_CUDA(cudaMemcpy(d_p, d_z, n*sizeof(double), cudaMemcpyDeviceToDevice));
-		    SAFE_CUDA(cudaDeviceSynchronize());
-		    double rz_new = dot_device(d_r, d_z, n);
-		    MPI_Allreduce(&rz_new, &rz_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-		    J_prev = -0.5 * ((dot_device(d_B,d_w,n) + dot_device(d_r,d_w,n)) * (h1*h2));
-		    if (restarted_prev) break;
-		    restarted_prev = 1;
-		    continue;
+			vec_sub_kernel<<<grid2d, block2d>>>(d_r, d_B, d_Aw_tmp, Nx, Ny);
+			SAFE_CUDA(cudaDeviceSynchronize());
+			vec_div_kernel<<<grid2d, block2d>>>(d_z, d_r, d_D, Nx, Ny);
+			SAFE_CUDA(cudaMemcpy(d_p, d_z, n*sizeof(double), cudaMemcpyDeviceToDevice));
+			SAFE_CUDA(cudaDeviceSynchronize());
+			double rz_new = dot_device(d_r, d_z, n);
+			MPI_Allreduce(&rz_new, &rz_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+			J_prev = -0.5 * ((dot_device(d_B,d_w,n) + dot_device(d_r,d_w,n)) * (h1*h2));
+			if (restarted_prev) break;
+			restarted_prev = 1;
+			continue;
 		} else {
-		    J_prev = Jk;
-		    SAFE_CUDA(cudaMemcpy(d_w_good, d_w, n*sizeof(double), cudaMemcpyDeviceToDevice));
-		    restarted_prev = 0;
+			J_prev = Jk;
+			SAFE_CUDA(cudaMemcpy(d_w_good, d_w, n*sizeof(double), cudaMemcpyDeviceToDevice));
+			restarted_prev = 0;
 		}
 
-		vec_div_kernel<<<blocksN, threads_per_block>>>(d_z, d_r, d_D, n);
+		vec_div_kernel<<<grid2d, block2d>>>(d_z, d_r, d_D, Nx, Ny);
 		SAFE_CUDA(cudaDeviceSynchronize());
 		double rz_new_local = dot_device(d_r, d_z, n);
 		double rz_new = 0.0;
@@ -279,7 +307,7 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 		MPI_Allreduce(&rz_new_local, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 		t_comm += MPI_Wtime() - t_c0;
 		double beta = rz_new / rz_global;
-		p_update_kernel<<<blocksN, threads_per_block>>>(d_p, d_z, beta, n);
+		p_update_kernel<<<grid2d, block2d>>>(d_p, d_z, beta, Nx, Ny);
 		SAFE_CUDA(cudaDeviceSynchronize());
 		rz_global = rz_new;
 	}
@@ -299,3 +327,4 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 
 	return w_final;
 }
+
