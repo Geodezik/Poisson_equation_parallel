@@ -12,8 +12,8 @@
 
 __global__ void pack_boundaries_kernel(const double* __restrict__ vec, int Nx, int Ny, double* __restrict__ send_left, double* __restrict__ send_right,
 double* __restrict__ send_down, double* __restrict__ send_up) {
-	int i0 = blockIdx.x * blockDim.x + threadIdx.x; // max Nx-1
-	int j0 = blockIdx.y * blockDim.y + threadIdx.y; // max Ny-1
+	int j0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int i0 = blockIdx.y * blockDim.y + threadIdx.y;
 	if (i0 == 0 && j0 < Ny) {
 		int idxL = j0;
 		int idxR = (Nx - 1) * Ny + j0;
@@ -33,10 +33,9 @@ const double* __restrict__ a, const double* __restrict__ b,
 const double* __restrict__ from_left, const double* __restrict__ from_right,
 const double* __restrict__ from_bot, const double* __restrict__ from_top,
 int Nx, int Ny, double h1, double h2) {
-	int i0 = blockIdx.x * blockDim.x + threadIdx.x;
-	int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+	int j0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int i0 = blockIdx.y * blockDim.y + threadIdx.y;
 	if (i0 >= Nx || j0 >= Ny) return;
-
 	int i = i0 + 1;
 	int j = j0 + 1;
 	int idx = i0 * Ny + j0;
@@ -59,8 +58,8 @@ int Nx, int Ny, double h1, double h2) {
 
 
 __global__ void wr_update_kernel(double* __restrict__ w, const double* __restrict__ p, double* __restrict__ r, const double* __restrict__ Ap, double alpha, int Nx, int Ny) {
-	int i0 = blockIdx.x * blockDim.x + threadIdx.x;
-	int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+	int j0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int i0 = blockIdx.y * blockDim.y + threadIdx.y;
 	if (i0 >= Nx || j0 >= Ny) return;
 	int idx = i0 * Ny + j0;
 	w[idx] += alpha * p[idx];
@@ -68,30 +67,27 @@ __global__ void wr_update_kernel(double* __restrict__ w, const double* __restric
 }
 
 __global__ void p_update_kernel(double* __restrict__ p, const double* __restrict__ z, double beta, int Nx, int Ny) {
-	int i0 = blockIdx.x * blockDim.x + threadIdx.x;
-	int j0 = blockIdx.y * blockDim.y + threadIdx.y;
+	int j0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int i0 = blockIdx.y * blockDim.y + threadIdx.y;
 	if (i0 >= Nx || j0 >= Ny) return;
 	int idx = i0 * Ny + j0;
 	p[idx] = z[idx] + beta * p[idx];
 }
 
 __global__ void vec_div_kernel(double* __restrict__ c, const double* __restrict__ a, const double* __restrict__ b, int Nx, int Ny) {
-    int i0 = blockIdx.x * blockDim.x + threadIdx.x;
-    int j0 = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i0 >= Nx || j0 >= Ny) return;
-    int idx = i0 * Ny + j0;
-    c[idx] = a[idx] / b[idx];
+	int j0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int i0 = blockIdx.y * blockDim.y + threadIdx.y;
+	if (i0 >= Nx || j0 >= Ny) return;
+	int idx = i0 * Ny + j0;
+	c[idx] = a[idx] / b[idx];
 }
 
-__global__ void vec_sub_kernel(double* __restrict__ c,
-                               const double* __restrict__ a,
-                               const double* __restrict__ b,
-                               int Nx, int Ny) {
-    int i0 = blockIdx.x * blockDim.x + threadIdx.x;
-    int j0 = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i0 >= Nx || j0 >= Ny) return;
-    int idx = i0 * Ny + j0;
-    c[idx] = a[idx] - b[idx];
+__global__ void vec_sub_kernel(double* __restrict__ c, const double* __restrict__ a, const double* __restrict__ b, int Nx, int Ny) {
+	int j0 = blockIdx.x * blockDim.x + threadIdx.x;
+	int i0 = blockIdx.y * blockDim.y + threadIdx.y;
+	if (i0 >= Nx || j0 >= Ny) return;
+	int idx = i0 * Ny + j0;
+	c[idx] = a[idx] - b[idx];
 }
 
 double dot_device(double* u, double* v, int n) {
@@ -129,7 +125,7 @@ struct Boundaries {
 
 void device_sendrecv_boundaries(const double* d_vec, int Nx, int Ny, Boundaries& boundaries, int rank_left, int rank_right, int rank_down, int rank_up) {
 	dim3 block2d(16, 16);
-	dim3 grid2d((Nx + block2d.x - 1) / block2d.x, (Ny + block2d.y - 1) / block2d.y);
+	dim3 grid2d((Ny + block2d.x - 1) / block2d.x, (Nx + block2d.y - 1) / block2d.y);
 
 	pack_boundaries_kernel<<<grid2d, block2d>>>(d_vec, Nx, Ny,
 	boundaries.d_send_left, boundaries.d_send_right,
@@ -191,7 +187,7 @@ std::vector<double> solve_linear_system_cuda(const std::vector<double>& B, const
 	SAFE_CUDA(cudaMemset(d_w, 0, n*sizeof(double)));
 
 	dim3 block2d(16, 16);
-	dim3 grid2d((Nx + block2d.x - 1) / block2d.x, (Ny + block2d.y - 1) / block2d.y);
+	dim3 grid2d((Ny + block2d.x - 1) / block2d.x, (Nx + block2d.y - 1) / block2d.y);
 
 	vec_div_kernel<<<grid2d, block2d>>>(d_z, d_r, d_D, Nx, Ny);
 	t_c0 = MPI_Wtime();
